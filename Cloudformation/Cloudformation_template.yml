@@ -1,0 +1,266 @@
+Parameters:
+  DomainName:
+    Type: String
+    Default: mydomain.com
+    Description: Domain name for the WordPress site
+  VpcId:
+    Description: ID of an existing Virtual Private Cloud (VPC).
+    Type: 'AWS::EC2::VPC::Id'
+
+  PublicSubnet1:
+    Description: First public subnet in the selected VPC
+    Type: 'AWS::EC2::Subnet::Id'
+
+  PublicSubnet2:
+    Description: Second public subnet in the selected VPC
+    Type: 'AWS::EC2::Subnet::Id'
+
+  PrivateSubnet1:
+    Description: First private subnet in the selected VPC
+    Type: 'AWS::EC2::Subnet::Id'
+
+  PrivateSubnet2:
+    Description: Second private subnet in the selected VPC
+    Type: 'AWS::EC2::Subnet::Id'
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Default: rafa_key
+
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0c64xxxxxx12d8c50
+    Description: AMI ID for the EC2 instance
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type
+
+  DBName:
+    Type: String
+    Default: wordpressdb
+    Description: The name of the WordPress database
+
+  DBUser:
+    Type: String
+    Default: root
+    Description: The MySQL database admin username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: password
+    Description: The MySQL database admin password
+
+Resources:
+  ICESecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ICE-SG
+      GroupDescription: Security group for EC2 Instance Connect
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.31.0.0/16
+
+  ApplicationLoadBalancer:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ApplicationLoadBalancersg
+      GroupDescription: Allow HTTP/S from the internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: EFS-sg
+      GroupDescription: Allow EC2 access to EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WordPressSecurityGroup
+
+  WordPressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: application-sg
+      GroupDescription: Enable HTTP access from ALB and EFS access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ApplicationLoadBalancer
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ApplicationLoadBalancer
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref ICESecurityGroup
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: rds-sg
+      GroupDescription: Allow MySQL access from app server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WordPressSecurityGroup
+
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref ICESecurityGroup
+
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: wordpressdb
+      AllocatedStorage: 10
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0.40
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      DBSubnetGroupName: threetier-subnetgroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      PubliclyAccessible: false
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: DBInstance
+    Properties:
+      LaunchTemplateName: wordpresstemplaterafaela
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref AMIId
+        KeyName: !Ref KeyName
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups:
+              - !Ref WordPressSecurityGroup
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+            - |
+              #!/bin/bash
+              echo "${FileSystem}.efs.${AWS::Region}.amazonaws.com:/ /srv/sites/${DomainName}/public_html/wp-content nfs4 nfsvers=4.1,tcp,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+              systemctl daemon-reload
+              mount -a
+              systemctl restart httpd
+              cd /srv/sites/${DomainName}/public_html
+              cp wp-config-sample.php wp-config.php
+              sed -i "s/database_name_here/${DBName}/" wp-config.php
+              sed -i "s/username_here/${DBUser}/" wp-config.php
+              sed -i "s/password_here/${DBPassword}/" wp-config.php
+              sed -i "s/localhost/${DBEndpoint}/" wp-config.php
+            - {
+                  DBName: !Ref DBName,
+                  DBUser: !Ref DBUser,
+                  DBPassword: !Ref DBPassword,
+                  DBEndpoint: !GetAtt DBInstance.Endpoint.Address,
+                  FileSystem: !Ref FileSystem
+                }
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: wordpress-asg-instance
+          PropagateAtLaunch: true
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ApplicationLoadBalancer
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: wordpress-lb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: wordpress-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /wp-config.php
+      Matcher:
+        HttpCode: 200
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
